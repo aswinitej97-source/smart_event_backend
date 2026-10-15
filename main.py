@@ -253,7 +253,8 @@ def get_events(
         )
 
     return query.all()
-
+import phase4
+phase4.install(app, get_current_user, require_roles)
 
 @app.get(
     "/events/{event_id}",
@@ -303,6 +304,7 @@ def organizer_create_event(
         ticket_price=event.ticket_price,
         banner_image=event.banner_image,
         organizer_id=current_user.id,
+        total_tickets=event.total_tickets,
     )
 
     db.add(new_event)
@@ -430,38 +432,7 @@ def create_booking(
         require_roles("USER")
     ),
 ):
-    event = (
-        db.query(models.Event)
-        .filter(
-            models.Event.id == booking.event_id
-        )
-        .first()
-    )
-
-    if not event:
-        raise HTTPException(
-            status_code=404,
-            detail="Event not found",
-        )
-
-    total_price = (
-        event.ticket_price *
-        booking.ticket_quantity
-    )
-
-    new_booking = models.Booking(
-        user_id=current_user.id,
-        event_id=event.id,
-        ticket_quantity=booking.ticket_quantity,
-        total_price=total_price,
-        booking_status="CONFIRMED",
-    )
-
-    db.add(new_booking)
-    db.commit()
-    db.refresh(new_booking)
-
-    return new_booking
+    return phase4.reserve_booking(db, current_user, booking)
 
 
 # =========================================================
@@ -502,27 +473,7 @@ def cancel_booking(
         require_roles("USER")
     ),
 ):
-    booking = (
-        db.query(models.Booking)
-        .filter(
-            models.Booking.id == booking_id,
-            models.Booking.user_id == current_user.id,
-        )
-        .first()
-    )
-
-    if not booking:
-        raise HTTPException(
-            status_code=404,
-            detail="Booking not found",
-        )
-
-    booking.booking_status = "CANCELLED"
-
-    db.commit()
-    db.refresh(booking)
-
-    return booking
+    return phase4.cancel_reserved_booking(db, current_user, booking_id)
 
 
 # =========================================================
@@ -861,3 +812,399 @@ def admin_analytics(
         "total_bookings": total_bookings,
         "total_revenue": total_revenue,
     }
+# ================= REVIEWS =================
+
+@app.post(
+    "/events/{event_id}/reviews",
+    response_model=schemas.ReviewResponse,
+    status_code=201,
+)
+def create_review(
+    event_id: int,
+    data: schemas.ReviewCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    event = db.query(models.Event).filter(
+        models.Event.id == event_id
+    ).first()
+
+    if not event:
+        raise HTTPException(404, "Event not found")
+
+    existing = db.query(models.Review).filter(
+        models.Review.user_id == current_user.id,
+        models.Review.event_id == event_id,
+    ).first()
+
+    if existing:
+        raise HTTPException(
+            409,
+            "You already reviewed this event",
+        )
+
+    review = models.Review(
+        user_id=current_user.id,
+        event_id=event_id,
+        rating=data.rating,
+        comment=data.comment,
+    )
+    db.add(review)
+    db.commit()
+    db.refresh(review)
+    return review
+
+
+@app.get(
+    "/events/{event_id}/reviews",
+    response_model=list[schemas.ReviewResponse],
+)
+def get_event_reviews(
+    event_id: int,
+    db: Session = Depends(get_db),
+):
+    event = db.query(models.Event).filter(
+        models.Event.id == event_id
+    ).first()
+
+    if not event:
+        raise HTTPException(404, "Event not found")
+
+    return db.query(models.Review).filter(
+        models.Review.event_id == event_id
+    ).order_by(
+        models.Review.created_at.desc(),
+        models.Review.id.desc(),
+    ).all()
+
+
+@app.get("/events/{event_id}/rating")
+def get_event_rating(
+    event_id: int,
+    db: Session = Depends(get_db),
+):
+    event = db.query(models.Event).filter(
+        models.Event.id == event_id
+    ).first()
+
+    if not event:
+        raise HTTPException(404, "Event not found")
+
+    average, count = db.query(
+        func.avg(models.Review.rating),
+        func.count(models.Review.id),
+    ).filter(
+        models.Review.event_id == event_id
+    ).one()
+
+    return {
+        "event_id": event_id,
+        "average_rating": round(float(average or 0), 2),
+        "total_reviews": count,
+    }
+
+
+@app.put(
+    "/reviews/{review_id}",
+    response_model=schemas.ReviewResponse,
+)
+def update_review(
+    review_id: int,
+    data: schemas.ReviewUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    review = db.query(models.Review).filter(
+        models.Review.id == review_id,
+        models.Review.user_id == current_user.id,
+    ).first()
+
+    if not review:
+        raise HTTPException(404, "Review not found")
+
+    review.rating = data.rating
+    review.comment = data.comment
+    db.commit()
+    db.refresh(review)
+    return review
+
+
+@app.delete("/reviews/{review_id}")
+def delete_review(
+    review_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    review = db.query(models.Review).filter(
+        models.Review.id == review_id,
+        models.Review.user_id == current_user.id,
+    ).first()
+
+    if not review:
+        raise HTTPException(404, "Review not found")
+
+    db.delete(review)
+    db.commit()
+    return {"message": "Review deleted successfully"}
+# ================= PAYMENTS & COUPONS =================
+
+from datetime import datetime, timezone
+from uuid import uuid4
+from sqlalchemy import update
+from sqlalchemy.exc import IntegrityError
+
+
+@app.post(
+    "/payments",
+    response_model=schemas.PaymentResponse,
+    status_code=201,
+)
+def make_payment(
+    data: schemas.PaymentCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    try:
+        # Atomic status change prevents duplicate concurrent payments.
+        claimed = db.execute(
+            update(models.Booking)
+            .where(
+                models.Booking.id == data.booking_id,
+                models.Booking.user_id == current_user.id,
+                models.Booking.booking_status == "PENDING",
+            )
+            .values(booking_status="PROCESSING")
+            .execution_options(synchronize_session=False)
+        )
+
+        if claimed.rowcount != 1:
+            raise HTTPException(
+                409,
+                "Booking unavailable or not pending",
+            )
+
+        booking = db.query(models.Booking).filter(
+            models.Booking.id == data.booking_id
+        ).first()
+
+        payment = db.query(models.Payment).filter(
+            models.Payment.booking_id == booking.id
+        ).first()
+
+        if payment and payment.payment_status == "SUCCESS":
+            raise HTTPException(409, "Already paid")
+
+        if not payment:
+            payment = models.Payment(booking_id=booking.id)
+            db.add(payment)
+
+        payment.payment_method = data.payment_method.strip()
+        payment.amount = booking.total_price
+        payment.transaction_id = f"SIM-{uuid4().hex}"
+        payment.payment_status = (
+            "SUCCESS" if data.simulate_success else "FAILED"
+        )
+        booking.booking_status = (
+            "CONFIRMED" if data.simulate_success else "PENDING"
+        )
+
+        db.commit()
+        db.refresh(payment)
+        return payment
+
+    except Exception:
+        db.rollback()
+        raise
+
+
+@app.get(
+    "/payments/my",
+    response_model=list[schemas.PaymentResponse],
+)
+def my_payments(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    return (
+        db.query(models.Payment)
+        .join(
+            models.Booking,
+            models.Payment.booking_id == models.Booking.id,
+        )
+        .filter(models.Booking.user_id == current_user.id)
+        .order_by(models.Payment.id.desc())
+        .all()
+    )
+
+
+@app.post(
+    "/admin/coupons",
+    response_model=schemas.CouponResponse,
+    status_code=201,
+)
+def create_coupon(
+    data: schemas.CouponCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_roles("ADMIN")),
+):
+    expiry = data.expiry_date
+    if expiry.tzinfo is not None:
+        expiry = expiry.astimezone(timezone.utc).replace(
+            tzinfo=None
+        )
+
+    if expiry <= datetime.now(timezone.utc).replace(tzinfo=None):
+        raise HTTPException(400, "Expiry must be in the future")
+
+    if (
+        data.discount_type == "PERCENTAGE"
+        and data.discount_value > 100
+    ):
+        raise HTTPException(
+            400, "Percentage cannot exceed 100"
+        )
+
+    coupon = models.Coupon(
+        coupon_code=data.coupon_code.upper(),
+        discount_type=data.discount_type,
+        discount_value=data.discount_value,
+        minimum_booking_amount=data.minimum_booking_amount,
+        expiry_date=expiry,
+        usage_limit=data.usage_limit,
+        is_active=data.is_active,
+    )
+
+    try:
+        db.add(coupon)
+        db.commit()
+        db.refresh(coupon)
+        return coupon
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "Coupon code already exists")
+
+
+@app.get(
+    "/admin/coupons",
+    response_model=list[schemas.CouponResponse],
+)
+def list_coupons(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_roles("ADMIN")),
+):
+    return db.query(models.Coupon).order_by(
+        models.Coupon.id.desc()
+    ).all()
+
+
+@app.post("/coupons/apply")
+def apply_coupon(
+    data: schemas.CouponApply,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    try:
+        # Payment and coupon application use the same booking lock.
+        claimed = db.execute(
+            update(models.Booking)
+            .where(
+                models.Booking.id == data.booking_id,
+                models.Booking.user_id == current_user.id,
+                models.Booking.booking_status == "PENDING",
+            )
+            .values(booking_status="PROCESSING")
+            .execution_options(synchronize_session=False)
+        )
+
+        if claimed.rowcount != 1:
+            raise HTTPException(
+                409, "Booking unavailable or not pending"
+            )
+
+        booking = db.query(models.Booking).filter(
+            models.Booking.id == data.booking_id
+        ).first()
+
+        already_used = db.query(models.CouponRedemption).filter(
+            models.CouponRedemption.booking_id == booking.id
+        ).first()
+
+        if already_used:
+            raise HTTPException(
+                409, "A coupon is already applied to this booking"
+            )
+
+        coupon = db.query(models.Coupon).filter(
+            models.Coupon.coupon_code
+            == data.coupon_code.strip().upper()
+        ).first()
+
+        if not coupon:
+            raise HTTPException(404, "Coupon not found")
+
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+        # Reserve usage atomically, including all eligibility checks.
+        reserved = db.execute(
+            update(models.Coupon)
+            .where(
+                models.Coupon.id == coupon.id,
+                models.Coupon.is_active.is_(True),
+                models.Coupon.expiry_date > now,
+                models.Coupon.used_count
+                < models.Coupon.usage_limit,
+                models.Coupon.minimum_booking_amount
+                <= booking.total_price,
+            )
+            .values(used_count=models.Coupon.used_count + 1)
+            .execution_options(synchronize_session=False)
+        )
+
+        if reserved.rowcount != 1:
+            raise HTTPException(
+                400,
+                "Coupon expired, inactive, exhausted, "
+                "or minimum amount not met",
+            )
+
+        original_total = booking.total_price
+
+        if coupon.discount_type == "PERCENTAGE":
+            discount = (
+                original_total * coupon.discount_value / 100
+            )
+        elif coupon.discount_type == "FIXED":
+            discount = coupon.discount_value
+        else:
+            raise HTTPException(400, "Invalid coupon type")
+
+        discount = round(min(discount, original_total), 2)
+        booking.total_price = round(
+            original_total - discount, 2
+        )
+        booking.booking_status = "PENDING"
+
+        db.add(models.CouponRedemption(
+            coupon_id=coupon.id,
+            booking_id=booking.id,
+            discount_amount=discount,
+        ))
+
+        result = {
+            "booking_id": booking.id,
+            "coupon_code": coupon.coupon_code,
+            "original_total": original_total,
+            "discount_amount": discount,
+            "total_price": booking.total_price,
+        }
+        db.commit()
+        return result
+
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            409, "Coupon already applied to this booking"
+        )
+    except Exception:
+        db.rollback()
+        raise

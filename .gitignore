@@ -5,3 +5,9 @@ __pycache__/
 venv/
 .venv/
 smartevent.db
+.env
+*.db
+*.db.*
+__pycache__/
+node_modules/
+main_backup.py
